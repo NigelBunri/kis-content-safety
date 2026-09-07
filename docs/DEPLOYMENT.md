@@ -25,22 +25,25 @@ kis-django/kis-nest/kisvideo.
    in-use ports the way kisvideo's 8010 was. Check `docker ps` /
    `ss -tlnp` on the box before deploying and update
    `docker-compose.prod.yml` if it collides.
-2. **Memory fit is a real open question, not just a limit to set.** See
-   README.md's "Resource sizing" section — the box had ~725MB free and
-   was already 1.4GB into swap at kisvideo's last check, before this
-   service's own ~367MB worst-case footprint is added on top of
-   kisvideo's 512M worker limit. This was flagged back to the team
-   (dev-3c) rather than resolved unilaterally in this pass — confirm the
-   actual resolution (reduced concurrency, a bigger box, scans staggered
-   away from active transcodes, etc.) before treating the 512M limit in
-   `docker-compose.prod.yml` as safe to deploy as-is.
-3. **Django-side settings are not yet wired.** `apps/media/
+2. **Memory fit — resolved 2026-09-07 with dev-3c.** The box had ~725MB
+   free and was already 1.4GB into swap at kisvideo's own sizing check,
+   before this service's footprint is added on top of kisvideo's 512M
+   worker limit. Rather than accept the original draft's `max_workers=2`
+   / 512M (worst case ~367MB), `app/main.py`'s `ThreadPoolExecutor` is
+   now `max_workers=1` and the compose limit is 384M (worst case ~284MB,
+   ~35% headroom) — see README.md's "Resource sizing" section for the
+   full numbers. Revisit only if this box is resized or this service
+   gets dedicated infra.
+3. **Django-side settings — owned by dev-3c, not this repo.** `apps/media/
    content_safety_provider.py` (in `backend/kis`, currently on the
    `content-safety-integration` worktree/branch, not yet on `main`) reads
    `MEDIA_SAFETY_SERVICE_ENABLED`, `MEDIA_SAFETY_SERVICE_BASE_URL`, and
    `MEDIA_SAFETY_SERVICE_INTERNAL_TOKEN` from Django settings — none of
-   these exist in `backend/kis`'s real `.env` yet (checked). Once this
-   service is deployed and reachable at its container name on
+   these exist in `backend/kis`'s real `.env` yet (checked). dev-3c is
+   adding these ahead of this service going live, with
+   `MEDIA_SAFETY_SERVICE_ENABLED` left off until the service is actually
+   deployed and reachable — safe to land independently. For reference,
+   once this service is deployed and reachable at its container name on
    `kis-production-network`, Django's `.env.production` needs:
    ```
    MEDIA_SAFETY_SERVICE_ENABLED=True
@@ -126,11 +129,26 @@ is expected, not a hang.
 
 ### Deploy
 
+The warmup call between `up -d` and traffic is not optional — see the
+caveat below the block for why. Do this every deploy, not just the first
+one.
+
 ```
 cd /opt/kis-content-safety
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d --force-recreate
+
+# Warmup: force model load now, on our own terms, instead of letting the
+# first real request (possibly from Django, with a 30s client timeout)
+# absorb a cold-start cost that measured ~49s locally. See the caveat
+# below for what this number is and isn't confirmed to mean.
+docker compose -f docker-compose.prod.yml exec api python -c "from app.detector import _get_detector; _get_detector()"
 ```
+
+If deploying alongside enabling `MEDIA_SAFETY_SERVICE_ENABLED` on the
+Django side for the first time, run the warmup call above and confirm it
+returns before flipping that flag on — don't let Django's first real
+scan request be the thing that discovers a cold-start problem.
 
 ### Validate
 
@@ -142,7 +160,8 @@ docker compose -f docker-compose.prod.yml logs api --tail=100
 ```
 
 Then a real scan call, not just `/health` — confirms the model actually
-loaded and inference works end to end, not just that the process started:
+loaded and inference works end to end, not just that the process started
+(and, having already run the warmup above, this should now be fast):
 
 ```
 curl -sS -X POST http://localhost:8020/scan/image \
@@ -152,23 +171,18 @@ curl -sS -X POST http://localhost:8020/scan/image \
 
 Expect `{"label": null or a string, "score": <float>}`, not a 5xx.
 
-**A cold first request can be slow.** Measured locally: a truly first-ever
-model load in a fresh environment took ~49s before settling to
-sub-second on every call after (see README.md's "Resource sizing"
-section for the full measurement and the caveat that the exact cause
-wasn't fully isolated — evidence points at cold OS-level file-cache for
-the bundled ONNX weights / onnxruntime's shared library, not a network
-download, since the weights ship inside the `nudenet` pip package and are
-baked into the image). Django's client (`content_safety_provider.py`)
-uses a 30s timeout for image scans — if the very first production
-request after a fresh container start hits this, it could time out
-client-side even though the service would have succeeded given a few
-more seconds. Worth a deliberate warmup call (e.g. `docker compose ...
-exec api python -c "from app.detector import _get_detector;
-_get_detector()"` right after `up -d`, before traffic is expected) rather
-than trusting the first real user request to absorb this cost — not yet
-automated into the deploy steps above, flagging as a real gap rather than
-quietly ignoring it.
+**Why the warmup call exists:** measured locally, a truly first-ever model
+load in a fresh environment took ~49s before settling to sub-second on
+every call after (see README.md's "Resource sizing" section for the full
+measurement and the caveat that the exact cause wasn't fully isolated —
+evidence points at cold OS-level file-cache for the bundled ONNX weights /
+onnxruntime's shared library, not a network download, since the weights
+ship inside the `nudenet` pip package and are baked into the image).
+Django's client (`content_safety_provider.py`) uses a 30s timeout for
+image scans, so an unwarmed first request could time out client-side even
+though the service would have succeeded a few seconds later. The warmup
+step in "Deploy" above closes this gap by paying that cost deliberately,
+before Django ever sends real traffic.
 
 ---
 
@@ -244,18 +258,19 @@ sustained spike here on normal-sized files points at CPU contention, not
 this service's own logic.
 
 **Container OOM-killed / restarting under load:**
-See README.md's "Resource sizing" section — the 512M limit here is a
+See README.md's "Resource sizing" section — the 384M limit here is a
 reasoned worst-case estimate (measured Python-process peak + a reused,
 not independently measured, ffmpeg-subprocess figure), not as tightly
-verified as kisvideo's own 512M figure. If this happens in practice:
-1. Check whether 2 video scans landed concurrently
-   (`app/main.py`'s `ThreadPoolExecutor(max_workers=2)`) — the estimate's
-   worst case assumes exactly this.
-2. Consider reducing `max_workers` to 1 in `app/main.py` (a code change,
-   not a config flag today) if this box can't sustain 2 concurrent scans
-   alongside kisvideo/Django/Nest — mirrors kisvideo's own
-   `--concurrency=1` reduction for the same CPU/RAM-constrained-box
-   reason.
+verified as kisvideo's own 512M figure. `app/main.py`'s
+`ThreadPoolExecutor` is already `max_workers=1` (dropped from an earlier
+2, specifically for this box's tight memory — see README.md), so an OOM
+here means either that assumption undercounted something (e.g. a much
+larger/longer video than tested, or genuine memory pressure from other
+services on the box at the same moment — check `docker stats` across all
+containers, not just this one) rather than a concurrency fix to apply. If
+it recurs, the real options are raising the limit (only if the box
+actually has room — it may not, see kisvideo's own header comment) or
+moving this service off the shared box entirely.
 
 **SSH disconnects mid-command:** same as every other service on this
 box — "Connection reset by peer" usually just means the SSH session

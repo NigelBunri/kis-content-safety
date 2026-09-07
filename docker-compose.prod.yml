@@ -22,7 +22,8 @@
 #
 # Only one process type here (no worker/beat split like kisvideo) - NudeNet
 # inference happens in-request, bounded by app/main.py's own
-# ThreadPoolExecutor(max_workers=2), not a separate queue consumer.
+# ThreadPoolExecutor(max_workers=1 on this box - see the memory limit
+# comment below for why), not a separate queue consumer.
 #
 # PORT 8020 IS A PROPOSAL, NOT CONFIRMED - unlike kisvideo's 8010 (verified
 # against the real server before that file was written), no one has checked
@@ -49,21 +50,18 @@ services:
     # peaked at ~201MB; a comparable ffmpeg single-frame-extraction
     # subprocess (reused from kisvideo's own measured thumbnail figure,
     # same operation shape, not independently measured in this repo)
-    # adds ~83MB; app/main.py's ThreadPoolExecutor(max_workers=2) means up
-    # to 2 concurrent scans, so up to 2 concurrent ffmpeg subprocesses in
-    # the worst case (the model itself is a shared singleton and does not
-    # duplicate per thread). Worst-case estimate: ~201MB + 2*83MB =~ 367MB;
-    # 512M leaves modest headroom over that - but READ THE CAVEAT in
-    # README.md before trusting this on the real box: 725MB free with
-    # 1.4GB already in swap does not comfortably fit another 512M ceiling
-    # next to kisvideo's own 512M worker. This was flagged back to the
-    # team rather than decided unilaterally here - see the deploy chat
-    # for the actual resolution (reduce max_workers to 1? stagger with
-    # kisvideo? bigger box?) before treating this limit as final.
+    # adds ~83MB. app/main.py's ThreadPoolExecutor is deliberately
+    # max_workers=1 (not 2) specifically because of this box's tight
+    # memory (~725MB free, already 1.4GB into swap before this service's
+    # own footprint - see kisvideo's docker-compose.prod.yml header) - so
+    # the worst case is one scan at a time: ~201MB + 83MB =~ 284MB. 384M
+    # leaves ~35% headroom over that, confirmed with dev-3c (2026-09-07)
+    # as the deliberate choice for this shared box over the earlier 512M/
+    # max_workers=2 draft.
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 384M
 
 networks:
   # external: true - this network already exists (created by the

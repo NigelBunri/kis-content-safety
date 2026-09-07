@@ -68,24 +68,24 @@ arm64, not the real Lightsail deployment target:
   single-frame grab, no encoding), which measured **~83MB** peak RSS for
   that subprocess. Treat this figure as a reasonable stand-in, not a
   verified number for this exact codebase.
-- **Concurrency**: `app/main.py`'s `ThreadPoolExecutor(max_workers=2)`
-  bounds this service to at most 2 in-flight scans. The model itself is a
-  process-wide singleton shared across threads (doesn't duplicate per
-  concurrent scan), but each concurrent *video* scan spawns its own ffmpeg
-  subprocess — worst case, 2 running at once.
-- **Worst-case estimate**: ~201MB (process baseline) + 2 × ~83MB (two
-  concurrent ffmpeg subprocesses) ≈ **~367MB**. `docker-compose.prod.yml`
-  sets a 512M limit — modest headroom over that estimate, not the
-  measured-peak-plus-30%-margin kisvideo's own limit is (that one measured
-  the real bottleneck directly; this one combines one real measurement
-  with one reused-from-elsewhere estimate).
+- **Concurrency**: `app/main.py`'s `ThreadPoolExecutor` is deliberately
+  `max_workers=1`, not 2 — see below. The model itself is a process-wide
+  singleton shared across threads (doesn't duplicate per concurrent scan);
+  with `max_workers=1` there's never more than one ffmpeg subprocess
+  running at a time either.
+- **Worst-case estimate at max_workers=1**: ~201MB (process baseline) +
+  ~83MB (one ffmpeg subprocess) ≈ **~284MB**. `docker-compose.prod.yml`
+  sets a 384M limit — ~35% headroom over that estimate.
 
-**Real, unresolved capacity concern — flagged, not silently absorbed:** the
-box this deploys to (same one as Django/Nest/chat/kisvideo) had ~725MB free
-and was already 1.4GB into swap at kisvideo's own sizing check (2026-09-07),
-*before* this service's ~367–512MB is added on top of kisvideo's own 512M
-worker limit. This wasn't resolved as part of writing these deployment
-files — see `docs/DEPLOYMENT.md`'s "Before the first deploy" section.
+**Real capacity concern, resolved 2026-09-07 with dev-3c:** the box this
+deploys to (same one as Django/Nest/chat/kisvideo) had ~725MB free and was
+already 1.4GB into swap at kisvideo's own sizing check, before this
+service's footprint is added on top of kisvideo's own 512M worker limit.
+The original draft assumed `max_workers=2` (worst case ~367MB, a 512M
+limit) — too much margin eaten on an already-tight box. Deliberately
+dropped to `max_workers=1` (worst case ~284MB, a 384M limit) instead of
+resizing the box, as the chosen tradeoff for this shared-infra deployment.
+Revisit if this box is ever resized or this service gets dedicated infra.
 
 **Cold-start latency, separately from memory:** a truly first-ever model
 load in a fresh local environment took **~49 seconds** (import + first

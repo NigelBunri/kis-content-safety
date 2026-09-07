@@ -19,7 +19,17 @@ app = FastAPI(title="KIS Content Safety")
 # run a handful of scans at a time, not a request-per-thread web server
 # workload. Bounding concurrency here also bounds memory (each in-flight
 # scan holds a full video's sampled frames / the model's own working set).
-_executor = ThreadPoolExecutor(max_workers=2)
+#
+# max_workers=1, not 2: this runs on the same shared Lightsail box as
+# Django/Nest/chat/kisvideo, which was already at ~725MB free and 1.4GB
+# into swap before this service's own footprint was added (see kisvideo's
+# docker-compose.prod.yml header and this repo's README.md "Resource
+# sizing" section for the measured numbers). 2 concurrent video scans
+# would mean 2 concurrent ffmpeg subprocesses on top of the shared model's
+# own resident memory — 1 keeps the worst case to a single ffmpeg
+# subprocess, halving that peak. Revisit if this box is ever resized or
+# this service gets dedicated infra.
+_executor = ThreadPoolExecutor(max_workers=1)
 
 
 class ScanResponse(BaseModel):
