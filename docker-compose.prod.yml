@@ -1,0 +1,75 @@
+# Production deployment config for the shared Lightsail box - NOT for
+# local dev (there is no docker-compose.yml yet since this service has no
+# local-dev database/queue to stand up - `uvicorn app.main:app --reload`
+# with a local .env is the whole local-dev story, see README.md).
+#
+# Same shared-infra box as Django/Nest/chat/kisvideo: 2 CPU cores, 3.7GB
+# RAM, ~725MB free and already 1.4GB in swap at kisvideo's last check
+# (2026-09-07, see kisvideo's own docker-compose.prod.yml header) - this
+# service adds real memory pressure on top of that, see README.md's
+# "Resource sizing" section before deploying, not just this file's limit.
+#
+# Unlike kisvideo, this service needs NEITHER kis-postgres NOR kis-redis -
+# confirmed by reading the actual code (app/config/settings.py has no
+# database_url/redis_url field at all, app/main.py uses a plain in-process
+# ThreadPoolExecutor, not Celery), not assumed from kisvideo's shape. It's
+# entirely stateless: every /scan/image or /scan/video call is a synchronous
+# request/response, no job table, no queue. See README.md's "Why a separate
+# service, and why no queue/DB" section for the full reasoning - that
+# section already exists in this repo, written by whoever built the
+# service, and this compose file simply doesn't fight it by adding
+# unneeded dependencies.
+#
+# Only one process type here (no worker/beat split like kisvideo) - NudeNet
+# inference happens in-request, bounded by app/main.py's own
+# ThreadPoolExecutor(max_workers=2), not a separate queue consumer.
+#
+# PORT 8020 IS A PROPOSAL, NOT CONFIRMED - unlike kisvideo's 8010 (verified
+# against the real server before that file was written), no one has checked
+# this against the actual Lightsail box's in-use ports yet. Confirm free
+# before first deploy; this comment should be updated once confirmed.
+
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8020:8000"
+    env_file: .env.production
+    networks:
+      - kis-production-network
+    # No named volume - every upload is a request-scoped tempfile (see
+    # app/main.py::_save_upload_to_tempfile), removed in the endpoint's
+    # own `finally` block before the response is even sent. Nothing here
+    # needs to survive a container restart.
+    #
+    # MEMORY LIMIT - see README.md's "Resource sizing" section for the
+    # full measured derivation. Short version: real /usr/bin/time -l
+    # measurement of this exact process (model load + image + video scans)
+    # peaked at ~201MB; a comparable ffmpeg single-frame-extraction
+    # subprocess (reused from kisvideo's own measured thumbnail figure,
+    # same operation shape, not independently measured in this repo)
+    # adds ~83MB; app/main.py's ThreadPoolExecutor(max_workers=2) means up
+    # to 2 concurrent scans, so up to 2 concurrent ffmpeg subprocesses in
+    # the worst case (the model itself is a shared singleton and does not
+    # duplicate per thread). Worst-case estimate: ~201MB + 2*83MB =~ 367MB;
+    # 512M leaves modest headroom over that - but READ THE CAVEAT in
+    # README.md before trusting this on the real box: 725MB free with
+    # 1.4GB already in swap does not comfortably fit another 512M ceiling
+    # next to kisvideo's own 512M worker. This was flagged back to the
+    # team rather than decided unilaterally here - see the deploy chat
+    # for the actual resolution (reduce max_workers to 1? stagger with
+    # kisvideo? bigger box?) before treating this limit as final.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+networks:
+  # external: true - this network already exists (created by the
+  # Django/Nest compose stack at /opt/kis). This file must never define
+  # its own `kis-production-network` - see kisvideo's docker-compose.prod.yml
+  # for why (name collision, or worse, a silent second network with the
+  # same name that leaves this service unreachable from Django).
+  kis-production-network:
+    external: true

@@ -50,3 +50,55 @@ bakes the weights into the image at build time (a throwaway container run
 during the build primes the cache, then the resulting layer is kept) — the
 monolith never did this (first real scan always ate a cold-start download),
 and this service deliberately doesn't carry that gap forward.
+
+## Resource sizing
+
+Measured locally (`/usr/bin/time -l` around the actual process — same
+discipline as kisvideo's own resource-sizing pass, not a guess), on macOS
+arm64, not the real Lightsail deployment target:
+
+- **Python process peak RSS** across model load + two image scans + one
+  video scan, all in one process lifetime: **~184–201MB** (two separate
+  runs, both in that range). This is the model (ONNX weights + onnxruntime
+  session) plus FastAPI/uvicorn/numpy overhead — the dominant, steady-state
+  cost.
+- **ffmpeg frame-extraction subprocess** (`scan_video`'s `-frames:v 1` calls):
+  not independently measured in this repo — reused from kisvideo's directly
+  comparable thumbnail-extraction measurement (same operation shape:
+  single-frame grab, no encoding), which measured **~83MB** peak RSS for
+  that subprocess. Treat this figure as a reasonable stand-in, not a
+  verified number for this exact codebase.
+- **Concurrency**: `app/main.py`'s `ThreadPoolExecutor(max_workers=2)`
+  bounds this service to at most 2 in-flight scans. The model itself is a
+  process-wide singleton shared across threads (doesn't duplicate per
+  concurrent scan), but each concurrent *video* scan spawns its own ffmpeg
+  subprocess — worst case, 2 running at once.
+- **Worst-case estimate**: ~201MB (process baseline) + 2 × ~83MB (two
+  concurrent ffmpeg subprocesses) ≈ **~367MB**. `docker-compose.prod.yml`
+  sets a 512M limit — modest headroom over that estimate, not the
+  measured-peak-plus-30%-margin kisvideo's own limit is (that one measured
+  the real bottleneck directly; this one combines one real measurement
+  with one reused-from-elsewhere estimate).
+
+**Real, unresolved capacity concern — flagged, not silently absorbed:** the
+box this deploys to (same one as Django/Nest/chat/kisvideo) had ~725MB free
+and was already 1.4GB into swap at kisvideo's own sizing check (2026-09-07),
+*before* this service's ~367–512MB is added on top of kisvideo's own 512M
+worker limit. This wasn't resolved as part of writing these deployment
+files — see `docs/DEPLOYMENT.md`'s "Before the first deploy" section.
+
+**Cold-start latency, separately from memory:** a truly first-ever model
+load in a fresh local environment took **~49 seconds** (import + first
+`NudeDetector()` instantiation + first inference, not isolated from each
+other in that run) before a second, separate run — same code, same
+machine, weights already resident from the first run — completed the
+equivalent work in under a second (0.48s model load, 0.05–0.07s per image
+scan). The gap is real and reproducible, but its exact cause wasn't fully
+isolated (most likely a cold OS-level file-cache / dynamic-linker cost for
+the bundled ONNX weights and onnxruntime's shared library on first touch,
+not a network fetch — the weights ship inside the `nudenet` pip package
+itself and are baked into the image, so there's no download to blame).
+Practical implication: don't assume the first request after a fresh
+container start responds quickly — see `docs/DEPLOYMENT.md`'s warmup-call
+recommendation and the timeout-mismatch risk against Django's 30s image
+client timeout.
