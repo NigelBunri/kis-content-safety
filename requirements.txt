@@ -1,0 +1,14 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+python-multipart>=0.0.12
+pydantic-settings>=2.6,<3
+
+# Same versions already pinned for this in backend/kis's requirements/base.txt
+# — keep in sync, this is the exact same detector logic ported out.
+nudenet==3.4.2
+onnxruntime==1.29.0
+numpy==2.3.4
+
+# Test-only
+pytest>=8.3,<10
+httpx>=0.27,<1
